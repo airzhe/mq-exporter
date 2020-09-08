@@ -1,0 +1,8 @@
+- apiurl: "http://10.2.4.25:15672"
+  vhost: "/"
+  user: admin
+  passwd: admin
+  monitor:
+    bi_payment_queue_delayed: #监控指标，由组名_服务名_为前缀
+      queue: mq-test #队列名称
+      desc: "延迟队列" 
