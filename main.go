@@ -12,6 +12,7 @@ import (
 
 	gxsync "github.com/dubbogo/gost/sync"
 	gxtime "github.com/dubbogo/gost/time"
+	"github.com/hashicorp/consul/api"
 	mqhole "github.com/michaelklishin/rabbit-hole/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -31,13 +32,20 @@ var (
 	cfgPath    string
 	version    bool
 	versionStr = "unknow"
+	consulAddr string
 	addr       string
 	wheel      *gxtime.Wheel
 	taskPool   *gxsync.TaskPool
+	err        error
 
-	config   []configItem
-	taskMap  sync.Map
-	taskList = make(map[string]func(), 0)
+	config     []configItem
+	configYaml []byte
+	taskMap    sync.Map
+	taskList   = make(map[string]func(), 0)
+
+	consulConfigKey = "mq-exporter/config.yaml"
+
+	mu sync.Mutex
 )
 
 type configItem struct {
@@ -56,6 +64,7 @@ type mqMetrics struct {
 func init() {
 	//读取命令行参数
 	flag.StringVar(&cfgPath, "config", "./config/config.yaml", "config file path")
+	flag.StringVar(&consulAddr, "consul", "", "consule addr")
 	flag.BoolVar(&version, "v", false, "version")
 	flag.StringVar(&addr, "addr", ":8082", "The address to listen on for HTTP requests.")
 
@@ -75,15 +84,56 @@ func main() {
 		fmt.Println(versionStr)
 		os.Exit(0)
 	}
+
 	//解析配置文件
-	file, err := ioutil.ReadFile(cfgPath)
+	initConfig()
+
+	//
+	dispatchTask()
+
+	//metrics server && pprof
+	go func() {
+		fmt.Println("server run...")
+		http.Handle("/metrics", promhttp.Handler())
+		http.Handle("/reload", http.HandlerFunc(reloadConfig))
+		logrus.Fatal(http.ListenAndServe(addr, nil))
+	}()
+
+	//执行任务
+	for {
+		select {
+		case <-wheel.After(5 * time.Second):
+			mu.Lock()
+			taskMap.Range(func(k, v interface{}) bool {
+				taskPool.AddTask(taskList[k.(string)])
+				return true
+			})
+			mu.Unlock()
+
+		}
+	}
+}
+
+func initConfig() {
+	if consulAddr == "" {
+		configYaml, err = ioutil.ReadFile(cfgPath)
+	} else {
+		configYaml, err = getConfigByConsul(consulAddr, consulConfigKey)
+	}
 	if err != nil {
 		logrus.Fatalf("Read config fail:%s", err)
 	}
-	err = yaml.Unmarshal(file, &config)
+	err = yaml.Unmarshal(configYaml, &config)
 	if err != nil {
 		logrus.Fatalf("Fatal error config file read fail:%s", err)
 	}
+}
+
+func dispatchTask() {
+	mu.Lock()
+	defer mu.Unlock()
+	logrus.Info("dispatch task")
+	taskMap = sync.Map{}
 	//prometheus rgistry
 	registry := prometheus.DefaultRegisterer
 	for i := 0; i < len(config); i++ {
@@ -100,7 +150,7 @@ func main() {
 				},
 				[]string{"attr"},
 			)
-			registry.MustRegister(gaugeMetrics)
+			registry.Register(gaugeMetrics)
 			//需要在此处定义队列名，函数内部使用v.QueueName会被修改
 			queueName := v.QueueName
 			//必包形式引用了父级变量
@@ -110,7 +160,6 @@ func main() {
 					logrus.Error(err)
 					return
 				}
-				//q是指针类型存在并发问题
 				q, err := rmqc.GetQueue(item.Vhost, queueName)
 				if err != nil {
 					logrus.Errorf("%s %s %s %v", item.Apiurl, item.Vhost, queueName, err)
@@ -123,22 +172,35 @@ func main() {
 			}
 		}
 	}
+}
 
-	//metrics server && pprof
-	go func() {
-		fmt.Println("server run...")
-		http.Handle("/metrics", promhttp.Handler())
-		logrus.Fatal(http.ListenAndServe(addr, nil))
-	}()
+// 重新加载配置文件
+func reloadConfig(w http.ResponseWriter, r *http.Request) {
+	logrus.Info("reload config")
+	initConfig()
+	dispatchTask()
+	fmt.Fprintln(w, "ok")
+}
 
-	//执行任务
-	for {
-		select {
-		case <-wheel.After(5 * time.Second):
-			taskMap.Range(func(k, v interface{}) bool {
-				taskPool.AddTask(taskList[k.(string)])
-				return true
-			})
-		}
+func getConfigByConsul(addr string, key string) ([]byte, error) {
+	client, err := api.NewClient(&api.Config{Address: addr})
+	if err != nil {
+		logrus.Error(err)
+		return nil, err
 	}
+
+	// Get a handle to the KV API
+	kv := client.KV()
+
+	// Lookup the pair
+	pair, _, err := kv.Get(key, nil)
+	if err != nil {
+		logrus.Error(err)
+		return nil, err
+	}
+	if pair == nil {
+		return nil, fmt.Errorf("从%s获取%s值为nil", addr, key)
+	}
+
+	return pair.Value, nil
 }

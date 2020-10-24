@@ -6,5 +6,5 @@ CONFIG=../config/config.yaml
 BIN=./mq-exporter
 LOG=../logs
 chmod +x $BIN
-$BIN -config=$CONFIG &>$LOG/nohup.log
+$BIN -config=$CONFIG -consul=$1 &>$LOG/nohup.log
 
