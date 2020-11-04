@@ -150,6 +150,7 @@ func dispatchTask() {
 				},
 				[]string{"attr"},
 			)
+			registry.Unregister(gaugeMetrics)
 			registry.Register(gaugeMetrics)
 			//需要在此处定义队列名，函数内部使用v.QueueName会被修改
 			queueName := v.QueueName
