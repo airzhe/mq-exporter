@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/928799934/googleAuthenticator"
 	gxsync "github.com/dubbogo/gost/sync"
 	gxtime "github.com/dubbogo/gost/time"
 	"github.com/hashicorp/consul/api"
@@ -43,6 +44,8 @@ var (
 	taskMap    sync.Map
 	taskList   = make(map[string]func(), 0)
 
+	secret string
+
 	consulConfigKey = "mq-exporter/config.yaml"
 
 	mu sync.Mutex
@@ -67,6 +70,7 @@ func init() {
 	flag.StringVar(&consulAddr, "consul", "", "consule addr")
 	flag.BoolVar(&version, "v", false, "version")
 	flag.StringVar(&addr, "addr", ":8082", "The address to listen on for HTTP requests.")
+	flag.StringVar(&secret, "secret", "", "api requests auth secret.")
 
 	buckets := maxWheelTimeSpan / timeSpan
 	wheel = gxtime.NewWheel(time.Duration(timeSpan), int(buckets)) //wheel longest span is 15 minute
@@ -96,6 +100,7 @@ func main() {
 		fmt.Println("server run...")
 		http.Handle("/metrics", promhttp.Handler())
 		http.Handle("/reload", http.HandlerFunc(reloadConfig))
+		http.Handle("/exit", http.HandlerFunc(exit))
 		logrus.Fatal(http.ListenAndServe(addr, nil))
 	}()
 
@@ -125,7 +130,7 @@ func initConfig() {
 	}
 	err = yaml.Unmarshal(configYaml, &config)
 	if err != nil {
-		logrus.Fatalf("Fatal error config file read fail:%s", err)
+		logrus.Warnf("Fatal error config file read fail:%s", err)
 	}
 }
 
@@ -175,12 +180,48 @@ func dispatchTask() {
 	}
 }
 
+func authCode(r *http.Request) (err error) {
+	if secret != "" {
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			return fmt.Errorf("%s", "code empty!")
+		}
+		ga := googleAuthenticator.NewGAuth()
+		ret, err := ga.VerifyCode(secret, code, 1)
+		if err != nil {
+			return err
+		}
+		if !ret {
+			return fmt.Errorf("%s", "code auth fail!")
+		}
+	}
+	return nil
+}
+
 // 重新加载配置文件
 func reloadConfig(w http.ResponseWriter, r *http.Request) {
+	err := authCode(r)
+	if err != nil {
+		fmt.Fprintln(w, err)
+		return
+	}
+
 	logrus.Info("reload config")
 	initConfig()
 	dispatchTask()
-	fmt.Fprintln(w, "ok")
+	fmt.Fprintln(w, "reload config success")
+}
+
+// 退出程序
+func exit(w http.ResponseWriter, r *http.Request) {
+	err := authCode(r)
+	if err != nil {
+		fmt.Fprintln(w, err)
+		return
+	}
+
+	logrus.Fatal("exit!")
+	fmt.Fprintln(w, "bye bye!")
 }
 
 func getConfigByConsul(addr string, key string) ([]byte, error) {
