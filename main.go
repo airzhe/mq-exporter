@@ -220,8 +220,8 @@ func exit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logrus.Fatal("exit!")
 	fmt.Fprintln(w, "bye bye!")
+	logrus.Fatal("exit!")
 }
 
 func getConfigByConsul(addr string, key string) ([]byte, error) {
