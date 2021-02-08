@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/928799934/googleAuthenticator"
 	gxsync "github.com/dubbogo/gost/sync"
 	gxtime "github.com/dubbogo/gost/time"
 	"github.com/hashicorp/consul/api"
@@ -43,7 +44,9 @@ var (
 	taskMap    sync.Map
 	taskList   = make(map[string]func(), 0)
 
-	consulConfigKey = "mq-exporter/config.yaml"
+	secret string
+
+	consulConfigKey = "mq-exporter/config"
 
 	mu sync.Mutex
 )
@@ -67,6 +70,7 @@ func init() {
 	flag.StringVar(&consulAddr, "consul", "", "consule addr")
 	flag.BoolVar(&version, "v", false, "version")
 	flag.StringVar(&addr, "addr", ":8082", "The address to listen on for HTTP requests.")
+	flag.StringVar(&secret, "secret", "", "api requests auth secret.")
 
 	buckets := maxWheelTimeSpan / timeSpan
 	wheel = gxtime.NewWheel(time.Duration(timeSpan), int(buckets)) //wheel longest span is 15 minute
@@ -84,18 +88,18 @@ func main() {
 		fmt.Println(versionStr)
 		os.Exit(0)
 	}
-
 	//解析配置文件
-	initConfig()
-
+	if err := initConfig(); err != nil {
+		return
+	}
 	//
 	dispatchTask()
-
 	//metrics server && pprof
 	go func() {
 		fmt.Println("server run...")
 		http.Handle("/metrics", promhttp.Handler())
 		http.Handle("/reload", http.HandlerFunc(reloadConfig))
+		http.Handle("/exit", http.HandlerFunc(exit))
 		logrus.Fatal(http.ListenAndServe(addr, nil))
 	}()
 
@@ -114,19 +118,23 @@ func main() {
 	}
 }
 
-func initConfig() {
+func initConfig() error {
+	var err error
 	if consulAddr == "" {
 		configYaml, err = ioutil.ReadFile(cfgPath)
 	} else {
 		configYaml, err = getConfigByConsul(consulAddr, consulConfigKey)
 	}
 	if err != nil {
-		logrus.Fatalf("Read config fail:%s", err)
+		logrus.Warnf("Read config fail:%s", err)
+		return err
 	}
 	err = yaml.Unmarshal(configYaml, &config)
 	if err != nil {
-		logrus.Fatalf("Fatal error config file read fail:%s", err)
+		logrus.Warnf("Unmarshal config fail:%s", err)
+		return err
 	}
+	return nil
 }
 
 func dispatchTask() {
@@ -140,21 +148,23 @@ func dispatchTask() {
 		item := config[i]
 		//
 		for k, v := range item.Monitor {
+			desc := v.Desc
 			//记录指标监控运行状态，0运行，1,暂停，2停止(后续实现此功能)
 			taskMap.Store(k, 0)
 			//创建metrics
 			gaugeMetrics := prometheus.NewGaugeVec(
 				prometheus.GaugeOpts{
 					Name: k,
-					Help: v.Desc,
+					Help: desc,
 				},
-				[]string{"attr"},
+				[]string{"attr", "desc"},
 			)
 			registry.Unregister(gaugeMetrics)
 			registry.Register(gaugeMetrics)
 			//需要在此处定义队列名，函数内部使用v.QueueName会被修改
 			queueName := v.QueueName
-			//必包形式引用了父级变量
+
+			//闭包形式引用了父级变量
 			taskList[k] = func() {
 				rmqc, err := mqhole.NewClient(item.Apiurl, item.User, item.Passwd)
 				if err != nil {
@@ -167,23 +177,63 @@ func dispatchTask() {
 					return
 				}
 				//fmt.Printf("%#v\n", q)
-				gaugeMetrics.WithLabelValues("message_ready").Set(float64(q.MessagesReady))
-				gaugeMetrics.WithLabelValues("message_unacknowledged").Set(float64(q.MessagesUnacknowledged))
-				gaugeMetrics.WithLabelValues("message_publish").Set(float64(q.MessageStats.Publish))
+				gaugeMetrics.WithLabelValues("message_ready", desc).Set(float64(q.MessagesReady))
+				gaugeMetrics.WithLabelValues("message_unacknowledged", desc).Set(float64(q.MessagesUnacknowledged))
+				gaugeMetrics.WithLabelValues("message_publish", desc).Set(float64(q.MessageStats.Publish))
 			}
 		}
 	}
 }
 
+func authCode(r *http.Request) (err error) {
+	if secret != "" {
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			return fmt.Errorf("%s", "code empty!")
+		}
+		ga := googleAuthenticator.NewGAuth()
+		ret, err := ga.VerifyCode(secret, code, 1)
+		if err != nil {
+			return err
+		}
+		if !ret {
+			return fmt.Errorf("%s", "code auth fail!")
+		}
+	}
+	return nil
+}
+
 // 重新加载配置文件
 func reloadConfig(w http.ResponseWriter, r *http.Request) {
+	err := authCode(r)
+	if err != nil {
+		fmt.Fprintln(w, err)
+		return
+	}
+
 	logrus.Info("reload config")
-	initConfig()
+	if err := initConfig(); err != nil {
+		return
+	}
 	dispatchTask()
-	fmt.Fprintln(w, "ok")
+	fmt.Fprintln(w, "reload config success")
+}
+
+// 退出程序
+func exit(w http.ResponseWriter, r *http.Request) {
+	err := authCode(r)
+	if err != nil {
+		fmt.Fprintln(w, err)
+		return
+	}
+
+	fmt.Fprintln(w, "bye bye!")
+	logrus.Fatal("exit!")
 }
 
 func getConfigByConsul(addr string, key string) ([]byte, error) {
+	var ret []byte
+
 	client, err := api.NewClient(&api.Config{Address: addr})
 	if err != nil {
 		logrus.Error(err)
@@ -193,15 +243,32 @@ func getConfigByConsul(addr string, key string) ([]byte, error) {
 	// Get a handle to the KV API
 	kv := client.KV()
 
-	// Lookup the pair
-	pair, _, err := kv.Get(key, nil)
+	pair, _, err := kv.List(consulConfigKey, nil)
 	if err != nil {
 		logrus.Error(err)
 		return nil, err
 	}
-	if pair == nil {
+	if len(pair) == 0 {
 		return nil, fmt.Errorf("从%s获取%s值为nil", addr, key)
 	}
 
-	return pair.Value, nil
+	for i := 0; i < len(pair); i++ {
+		ret = append(ret, pair[i].Value...)
+		ret = append(ret, 13)
+	}
+	return ret, nil
+
+	/*
+		// Lookup the pair
+		pair, _, err := kv.Get(key, nil)
+		if err != nil {
+			logrus.Error(err)
+			return nil, err
+		}
+		if pair == nil {
+			return nil, fmt.Errorf("从%s获取%s值为nil", addr, key)
+		}
+
+		return pair.Value, nil
+	*/
 }
